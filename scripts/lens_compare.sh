@@ -74,12 +74,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
+PY_EXTRA_ARGS=()
+
 if [[ -n "$CROP_A" && -n "$CROP_B" ]]; then
   TMP_DIR="$(mktemp -d)"
   TARGET_A="${TMP_DIR}/roi_a.png"
   TARGET_B="${TMP_DIR}/roi_b.png"
   magick "$IMG_A" -crop "$CROP_A" +repage "$TARGET_A"
   magick "$IMG_B" -crop "$CROP_B" +repage "$TARGET_B"
+  PY_EXTRA_ARGS+=(
+    --source-a "$IMG_A"
+    --source-b "$IMG_B"
+    --crop-a "$CROP_A"
+    --crop-b "$CROP_B"
+  )
   if [[ "$JSON_MODE" -eq 1 ]]; then
     echo "=== Cropped ROIs: A=$CROP_A, B=$CROP_B ===" >&2
   else
@@ -88,8 +96,8 @@ if [[ -n "$CROP_A" && -n "$CROP_B" ]]; then
 fi
 
 if [[ "$JSON_MODE" -eq 1 ]]; then
-  python3 "$PY_SCRIPT" --json "$TARGET_A" "$TARGET_B"
+  python3 "$PY_SCRIPT" --json "${PY_EXTRA_ARGS[@]}" "$TARGET_A" "$TARGET_B"
 else
   echo "=== Quantitative Comparison ==="
-  python3 "$PY_SCRIPT" "$TARGET_A" "$TARGET_B"
+  python3 "$PY_SCRIPT" "${PY_EXTRA_ARGS[@]}" "$TARGET_A" "$TARGET_B"
 fi

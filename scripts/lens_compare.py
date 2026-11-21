@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Compare CIELAB, per-color sector saturation, sharpness, and summary biases."""
+"""Compare CIELAB, per-color sector saturation, sharpness, and EXIF metadata."""
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 import numpy as np
 from skimage import color, filters, io
@@ -15,6 +17,51 @@ COLOR_SECTORS = [
     ("cyan_blue", 165.0, 255.0),
     ("violet_purple", 255.0, 330.0),
 ]
+
+RELEVANT_EXIF_TAGS = [
+    "FileName",
+    "FileSize",
+    "ImageSize",
+    "Make",
+    "Model",
+    "LensInfo",
+    "LensID",
+    "LensSpec",
+    "FocalLength",
+    "FocalLengthIn35mmFormat",
+    "FNumber",
+    "ApertureValue",
+    "ExposureTime",
+    "ShutterSpeedValue",
+    "ISO",
+    "ExposureCompensation",
+    "ExposureProgram",
+    "MeteringMode",
+    "WhiteBalance",
+    "ColorSpace",
+    "Flash",
+    "DateTimeOriginal",
+]
+
+
+def extract_exif(image_path: str) -> dict:
+    """Extract relevant EXIF/metadata tags via exiftool as a clean dictionary."""
+    try:
+        proc = subprocess.run(
+            ["exiftool", "-j", "-n", *[f"-{tag}" for tag in RELEVANT_EXIF_TAGS], image_path],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            records = json.loads(proc.stdout)
+            if isinstance(records, list) and records:
+                raw = dict(records[0])
+                raw.pop("SourceFile", None)
+                return raw
+    except FileNotFoundError:
+        pass
+    return {}
 
 
 def load_rgb_float(path: str) -> np.ndarray:
@@ -34,12 +81,18 @@ def sector_mask(hue_deg: np.ndarray, chroma: np.ndarray, min_chroma: float, star
     if start <= end:
         in_hue = (hue_deg >= start) & (hue_deg < end)
     else:
-        # Wrap-around sector (e.g., 330..360 or 0..30)
         in_hue = (hue_deg >= start) | (hue_deg < end)
     return active & in_hue
 
 
-def summarize_sector(mask: np.ndarray, total_pixels: int, L: np.ndarray, a: np.ndarray, b: np.ndarray, chroma: np.ndarray) -> dict:
+def summarize_sector(
+    mask: np.ndarray,
+    total_pixels: int,
+    L: np.ndarray,
+    a: np.ndarray,
+    b: np.ndarray,
+    chroma: np.ndarray,
+) -> dict:
     count = int(np.count_nonzero(mask))
     pixel_pct = (count / total_pixels * 100.0) if total_pixels > 0 else 0.0
     if count == 0:
@@ -143,7 +196,6 @@ def build_summary(stats_a: dict, stats_b: dict, color_deltas: dict) -> dict:
         diff_sharp, 0.0015, "A higher edge gradient/micro-contrast than B", "A lower edge gradient/micro-contrast than B", "Similar edge gradient"
     )
 
-    # Identify color sector with largest absolute chroma_mean delta
     best_sector = None
     best_abs_delta = 0.0
     best_direction = None
@@ -201,7 +253,38 @@ def make_delta(val_a, val_b) -> dict:
     return {"diff_a_minus_b": float(diff), "pct_diff_a_vs_b": float(pct)}
 
 
-def build_comparison(path_a: str, path_b: str, min_chroma: float) -> dict:
+def build_image_descriptor(
+    analyzed_path: str,
+    source_path: str | None = None,
+    label: str | None = None,
+    crop: str | None = None,
+    exif_override: dict | None = None,
+) -> dict:
+    orig = source_path or analyzed_path
+    exif_data = exif_override if exif_override is not None else extract_exif(orig)
+    name = label or exif_data.get("FileName") or os.path.basename(orig)
+    return {
+        "name": name,
+        "path": orig,
+        "analyzed_path": analyzed_path,
+        "crop": crop,
+        "exif": exif_data,
+    }
+
+
+def build_comparison(
+    path_a: str,
+    path_b: str,
+    min_chroma: float,
+    source_a: str | None = None,
+    source_b: str | None = None,
+    label_a: str | None = None,
+    label_b: str | None = None,
+    crop_a: str | None = None,
+    crop_b: str | None = None,
+    exif_a: dict | None = None,
+    exif_b: dict | None = None,
+) -> dict:
     stats_a = analyze_image(path_a, min_chroma)
     stats_b = analyze_image(path_b, min_chroma)
 
@@ -222,8 +305,8 @@ def build_comparison(path_a: str, path_b: str, min_chroma: float) -> dict:
     summary = build_summary(stats_a, stats_b, color_deltas)
 
     return {
-        "image_a": path_a,
-        "image_b": path_b,
+        "image_a": build_image_descriptor(path_a, source_a, label_a, crop_a, exif_a),
+        "image_b": build_image_descriptor(path_b, source_b, label_b, crop_b, exif_b),
         "min_chroma_threshold": min_chroma,
         "summary": summary,
         "metrics_a": stats_a,
@@ -235,12 +318,29 @@ def build_comparison(path_a: str, path_b: str, min_chroma: float) -> dict:
     }
 
 
+def parse_exif_arg(raw: str | None) -> dict | None:
+    if not raw:
+        return None
+    if os.path.isfile(raw):
+        with open(raw, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    return json.loads(raw)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Compute and compare CIELAB, per-color sector saturation, and sharpness metrics."
     )
     parser.add_argument("image_a", help="First image path (e.g., 55mmf35.jpg)")
     parser.add_argument("image_b", help="Second image path (e.g., 55mmf28.jpg)")
+    parser.add_argument("--source-a", default=None, help="Original source path for Image A if cropped.")
+    parser.add_argument("--source-b", default=None, help="Original source path for Image B if cropped.")
+    parser.add_argument("--label-a", default=None, help="Display name for Image A.")
+    parser.add_argument("--label-b", default=None, help="Display name for Image B.")
+    parser.add_argument("--crop-a", default=None, help="Crop geometry applied to Image A.")
+    parser.add_argument("--crop-b", default=None, help="Crop geometry applied to Image B.")
+    parser.add_argument("--exif-a", default=None, help="JSON string or file path with pre-extracted EXIF for A.")
+    parser.add_argument("--exif-b", default=None, help="JSON string or file path with pre-extracted EXIF for B.")
     parser.add_argument(
         "--min-chroma",
         type=float,
@@ -254,7 +354,19 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    result = build_comparison(args.image_a, args.image_b, args.min_chroma)
+    result = build_comparison(
+        path_a=args.image_a,
+        path_b=args.image_b,
+        min_chroma=args.min_chroma,
+        source_a=args.source_a,
+        source_b=args.source_b,
+        label_a=args.label_a,
+        label_b=args.label_b,
+        crop_a=args.crop_a,
+        crop_b=args.crop_b,
+        exif_a=parse_exif_arg(args.exif_a),
+        exif_b=parse_exif_arg(args.exif_b),
+    )
 
     if args.json:
         print(json.dumps(result, indent=2))
@@ -264,8 +376,8 @@ def main() -> int:
     gb = result["metrics_b"]["global"]
     summary = result["summary"]
 
-    print(f"Image A: {args.image_a}")
-    print(f"Image B: {args.image_b}")
+    print(f"Image A: {result['image_a']['name']} ({result['image_a']['path']})")
+    print(f"Image B: {result['image_b']['name']} ({result['image_b']['path']})")
     print(f"Min Chroma Threshold: {args.min_chroma:.1f}")
     print("-" * 78)
     print(f"{'Global Metric':<20} {'Image A':>13} {'Image B':>13} {'Diff (A-B)':>15} {'% Diff':>13}")
