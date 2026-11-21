@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare CIELAB, per-color sector saturation, sharpness, and EXIF metadata."""
+"""Compare CIELAB, tonal contrast, deep blacks, per-color sector saturation, sharpness, and EXIF."""
 
 import argparse
 import json
@@ -9,7 +9,6 @@ import sys
 import numpy as np
 from skimage import color, filters, io
 
-# Hue angle sectors in degrees [0, 360), computed via atan2(b*, a*) mod 360
 COLOR_SECTORS = [
     ("red_magenta", 330.0, 30.0),
     ("warm_yellow_amber", 30.0, 105.0),
@@ -45,7 +44,6 @@ RELEVANT_EXIF_TAGS = [
 
 
 def extract_exif(image_path: str) -> dict:
-    """Extract relevant EXIF/metadata tags via exiftool as a clean dictionary."""
     try:
         proc = subprocess.run(
             ["exiftool", "-j", "-n", *[f"-{tag}" for tag in RELEVANT_EXIF_TAGS], image_path],
@@ -118,7 +116,7 @@ def summarize_sector(
 
 def analyze_image(path: str, min_chroma: float) -> dict:
     rgb = load_rgb_float(path)
-    lab = color.rgb2lab(rgb)  # D65 standard illuminant
+    lab = color.rgb2lab(rgb)
     hsv = color.rgb2hsv(rgb)
 
     L = lab[..., 0]
@@ -127,6 +125,13 @@ def analyze_image(path: str, min_chroma: float) -> dict:
     chroma = np.hypot(a, b)
     hue_deg = np.mod(np.degrees(np.arctan2(b, a)), 360.0)
     hsv_sat = hsv[..., 1]
+
+    l_p05 = float(np.percentile(L, 5))
+    l_p10 = float(np.percentile(L, 10))
+    l_p25 = float(np.percentile(L, 25))
+    l_p75 = float(np.percentile(L, 75))
+    l_iqr = float(l_p75 - l_p25)
+    l_std = float(np.std(L))
 
     lum = np.clip(L / 100.0, 0.0, 1.0)
     sobel_mag = filters.sobel(lum)
@@ -144,6 +149,10 @@ def analyze_image(path: str, min_chroma: float) -> dict:
         "global": {
             "L_mean": float(np.mean(L)),
             "L_median": float(np.median(L)),
+            "L_p05": l_p05,
+            "L_p10": l_p10,
+            "L_std": l_std,
+            "L_iqr": l_iqr,
             "a_mean": float(np.mean(a)),
             "a_median": float(np.median(a)),
             "b_mean": float(np.mean(b)),
@@ -177,6 +186,8 @@ def build_summary(stats_a: dict, stats_b: dict, color_deltas: dict) -> dict:
     diff_b = ga["b_mean"] - gb["b_mean"]
     diff_a = ga["a_mean"] - gb["a_mean"]
     diff_L = ga["L_mean"] - gb["L_mean"]
+    diff_p05 = ga["L_p05"] - gb["L_p05"]
+    diff_std = ga["L_std"] - gb["L_std"]
     diff_chroma = ga["chroma_mean"] - gb["chroma_mean"]
     diff_sharp = ga["sobel_mean"] - gb["sobel_mean"]
 
@@ -188,6 +199,12 @@ def build_summary(stats_a: dict, stats_b: dict, color_deltas: dict) -> dict:
     )
     lightness_bias = classify_bias(
         diff_L, 0.50, "A brighter/higher L* than B", "A darker/lower L* than B", "Similar overall lightness (L*)"
+    )
+    black_level_bias = classify_bias(
+        diff_p05, 0.50, "A lifted/lighter blacks (L_p05) than B", "A deeper blacks/shadows (L_p05) than B", "Similar shadow floor (L_p05)"
+    )
+    tonal_contrast_bias = classify_bias(
+        diff_std, 0.40, "A higher tonal contrast (L_std) than B", "A lower tonal contrast (L_std) than B", "Similar tonal contrast (L_std)"
     )
     chroma_bias = classify_bias(
         diff_chroma, 0.35, "A higher overall chroma than B", "A lower overall chroma than B", "Similar overall chroma"
@@ -215,15 +232,19 @@ def build_summary(stats_a: dict, stats_b: dict, color_deltas: dict) -> dict:
         favors.append("warmer yellow/amber tones")
     elif diff_b < -0.25:
         favors.append("cooler blue/cyan tones")
-    if diff_sharp > 0.0015:
-        favors.append("stronger local micro-contrast")
-    elif diff_sharp < -0.0015:
-        favors.append("gentler local micro-contrast")
+    if diff_p05 < -0.50:
+        favors.append("deeper blacks/shadows")
+    elif diff_p05 > 0.50:
+        favors.append("lifted/lighter blacks")
+    if diff_std > 0.40 or diff_sharp > 0.0015:
+        favors.append("stronger contrast/micro-contrast")
+    elif diff_std < -0.40 or diff_sharp < -0.0015:
+        favors.append("gentler contrast/micro-contrast")
 
     summary_text = (
         f"Image A tends to favour {', '.join(favors)} relative to Image B."
         if favors
-        else "Image A and Image B are closely matched across global chroma, warmth, and micro-contrast."
+        else "Image A and Image B are closely matched across global chroma, warmth, contrast, and micro-contrast."
     )
     if best_sector and best_abs_delta >= 0.25:
         summary_text += f" Largest per-color chroma shift: {best_sector} ({best_direction}, {best_abs_delta:+.4f})."
@@ -232,6 +253,8 @@ def build_summary(stats_a: dict, stats_b: dict, color_deltas: dict) -> dict:
         "warmth_bias": warmth_bias,
         "red_green_bias": red_green_bias,
         "lightness_bias": lightness_bias,
+        "black_level_bias": black_level_bias,
+        "tonal_contrast_bias": tonal_contrast_bias,
         "chroma_bias": chroma_bias,
         "sharpness_bias": sharpness_bias,
         "largest_chroma_shift": {
@@ -329,7 +352,7 @@ def parse_exif_arg(raw: str | None) -> dict | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Compute and compare CIELAB, per-color sector saturation, and sharpness metrics."
+        description="Compute and compare CIELAB, contrast, deep blacks, color saturation, and sharpness."
     )
     parser.add_argument("image_a", help="First image path (e.g., 55mmf35.jpg)")
     parser.add_argument("image_b", help="Second image path (e.g., 55mmf28.jpg)")
@@ -405,6 +428,8 @@ def main() -> int:
     print(f"Warmth       : {summary['warmth_bias']}")
     print(f"Red-Green    : {summary['red_green_bias']}")
     print(f"Lightness    : {summary['lightness_bias']}")
+    print(f"Black Level  : {summary['black_level_bias']}")
+    print(f"Tonal Contrast: {summary['tonal_contrast_bias']}")
     print(f"Chroma       : {summary['chroma_bias']}")
     print(f"Sharpness    : {summary['sharpness_bias']}")
 

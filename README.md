@@ -6,8 +6,8 @@ These scripts provide a repeatable, objective way to compare two lens test image
 
 1. **Verifies capture consistency** by extracting key EXIF metadata (`exiftool`) and embedding it directly into the structured JSON output alongside image identifiers and crop info.
 2. **Isolates matched regions of interest (ROIs)** via optional ImageMagick (`magick`) cropping so framing shifts or field curvature differences do not skew the comparison.
-3. **Measures global and per-color perceptual metrics** in Python (`lens_compare.py`) using the **CIELAB** color space (D65 standard illuminant), hue-sector partitioning, HSV saturation, and luminance edge-gradient filters.
-4. **Generates automated bias summaries** (e.g., warmer vs. cooler, higher vs. lower chroma, and which color sector shifted the most).
+3. **Measures global and per-color perceptual metrics** in Python (`lens_compare.py`) using the **CIELAB** color space (D65 standard illuminant), hue-sector partitioning, HSV saturation, tonal contrast/shadow floor metrics, and luminance edge-gradient filters.
+4. **Generates automated bias summaries** (e.g., warmer vs. cooler, higher vs. lower chroma, deeper vs. lifted blacks, higher vs. lower tonal contrast, and which color sector shifted the most).
 5. **Outputs either a formatted report or structured JSON** (`--json`) for logging, scripting, or `jq` queries.
 
 ## Requirements
@@ -83,7 +83,7 @@ In the JSON output, `image_a` and `image_b` are objects describing each input im
 
 ## Metric Definitions
 
-### 1. Global CIELAB Lightness & Color Axes (`metrics_a.global`, `metrics_b.global`)
+### 1. Global CIELAB Lightness, Deep Blacks, Contrast & Color Axes (`metrics_a.global`, `metrics_b.global`)
 
 CIELAB separates perceptual brightness from color chromaticity, making it far more consistent for optical comparisons than raw RGB values.
 
@@ -91,6 +91,10 @@ CIELAB separates perceptual brightness from color chromaticity, making it far mo
 | :--- | :--- | :--- |
 | **`L_mean`** | `0` to `100` | **Average perceptual lightness ($L^*$).** `0` is pure black and `100` is diffuse white. Useful for verifying that exposure equalisation between two frames is closely matched. |
 | **`L_median`** | `0` to `100` | **Median perceptual lightness ($L^*$).** Less sensitive than `L_mean` to small specular highlights (e.g., flash glints on metal) or deep pin-prick shadows. |
+| **`L_p05`** | `0` to `100` | **5th-percentile lightness ($L^*$) — deep blacks / shadow floor.** Measures how dark the lower shadow/black tones sit; lower values indicate deeper blacks/shadows. |
+| **`L_p10`** | `0` to `100` | **10th-percentile lightness ($L^*$) — shadow floor.** Slightly broader shadow floor indicator than `L_p05`, less sensitive to single-pixel noise. |
+| **`L_std`** | `0` to `100` | **Standard deviation of lightness ($L^*$) — global tonal contrast.** Measures overall spread of brightness across the image/crop; higher values indicate wider tonal contrast. |
+| **`L_iqr`** | `0` to `100` | **Interquartile range of lightness ($L_{p75} - L_{p25}$) — midtone contrast.** Measures spread across the middle 50% of tones without being skewed by extreme highlights or shadows. |
 | **`a_mean`** | Roughly `-128` to `+127` | **Average green–red color balance ($a^*$).** Negative values lean toward green/cyan; positive values lean toward magenta/red. |
 | **`a_median`** | Roughly `-128` to `+127` | **Median green–red color balance ($a^*$).** Shows the central tendency of the $a^*$ axis without extreme color outliers. |
 | **`b_mean`** | Roughly `-128` to `+127` | **Average blue–yellow color balance ($b^*$).** Negative values lean toward blue; positive values lean toward yellow/warm amber. |
@@ -104,10 +108,10 @@ CIELAB separates perceptual brightness from color chromaticity, making it far mo
 | **`chroma_median`** | $C^* = \sqrt{(a^*)^2 + (b^*)^2}$ | **Median perceptual chroma.** Reflects typical color intensity across the frame/crop without being pulled upward by a few vividly colored accents. |
 | **`chroma_p90`** | 90th percentile of $C^*$ | **Peak color intensity (top 10%).** Captures how strongly a lens renders the most saturated features in the frame while ignoring extreme outliers. |
 | **`hsv_sat_mean`** | `0.0` to `1.0` | **Average HSV saturation.** A standard cylindrical color-model measure of color purity (`0.0` = greyscale, `1.0` = pure saturated color). |
-| **`hsv_sat_p90`** | `0.0` to `1.0` | 90th-percentile HSV **saturation.** Indicates the saturation level of the more vivid parts of the image in HSV space. |
+| **`hsv_sat_p90`** | `0.0` to `1.0` | **90th-percentile HSV saturation.** Indicates the saturation level of the more vivid parts of the image in HSV space. |
 | **`colored_pixel_pct`** | `%` of pixels with $C^* \ge \text{min\_chroma}$ | **Non-neutral pixel share.** Shows what percentage of the frame/crop has enough chroma (default $C^* \ge 8.0$) to be classified into the color-sector breakdown. |
 | **`sobel_mean`** | Mean Sobel gradient on $L^*/100$ | **Average edge strength / micro-contrast.** Measures the average rate of brightness change across pixels. Higher values indicate crisper fine detail and stronger local contrast. |
-| **`sobel_p90`** | 90th-percentile Sobel gradient | Strong-edge **crispness.** Focuses on well-defined edges (engraving, lettering, ruler ticks) rather than smooth background areas. |
+| **`sobel_p90`** | 90th-percentile Sobel gradient | **Strong-edge crispness.** Focuses on well-defined edges (engraving, lettering, ruler ticks) rather than smooth background areas. |
 | **`laplacian_var`** | Variance of 2D Laplacian on $L^*/100$ | **High-frequency edge energy.** Sensitive to rapid second-order intensity transitions. Higher values generally indicate sharper focus/micro-contrast, though noise or highlight clipping can also raise it. |
 
 ### 3. Per-Color Sector Breakdown (`metrics_a.by_color`, `metrics_b.by_color`)
@@ -137,6 +141,8 @@ The `summary` object translates the numeric deltas between Image A and Image B i
 | **`warmth_bias`** | Compares `b_mean` ($\Delta b^* > +0.25 \rightarrow$ A is warmer/more yellow; $\Delta b^* < -0.25 \rightarrow$ A is cooler/more blue). |
 | **`red_green_bias`** | Compares `a_mean` ($\Delta a^* > +0.20 \rightarrow$ A leans more red/magenta; $\Delta a^* < -0.20 \rightarrow$ A leans more green). |
 | **`lightness_bias`** | Compares `L_mean` ($\Delta L^* > +0.50 \rightarrow$ A is brighter; $\Delta L^* < -0.50 \rightarrow$ A is darker). |
+| **`black_level_bias`** | Compares `L_p05` ($\Delta L_{p05} < -0.50 \rightarrow$ A has deeper blacks/shadows; $\Delta L_{p05} > +0.50 \rightarrow$ A has lifted/lighter blacks). |
+| **`tonal_contrast_bias`** | Compares `L_std` ($\Delta L_{\text{std}} > +0.40 \rightarrow$ A has higher tonal contrast; $\Delta L_{\text{std}} < -0.40 \rightarrow$ A has lower tonal contrast). |
 | **`chroma_bias`** | Compares `chroma_mean` ($\Delta C^* > +0.35 \rightarrow$ A has higher overall chroma; $\Delta C^* < -0.35 \rightarrow$ A has lower overall chroma). |
 | **`sharpness_bias`** | Compares `sobel_mean` ($\Delta \text{sobel} > +0.0015 \rightarrow$ A has stronger local edge gradient/micro-contrast). |
 | **`largest_chroma_shift`** | Identifies which color sector (`sector`), raw difference (`diff_a_minus_b`), and direction (`direction`) experienced the largest absolute `chroma_mean` change between the two lenses. |
@@ -156,12 +162,12 @@ The `summary` object translates the numeric deltas between Image A and Image B i
 * **`diff_a_minus_b`**: Raw signed difference ($\text{Image A} - \text{Image B}$). Positive means Image A has a higher value; negative means Image B is higher.
 * **`pct_diff_a_vs_b`**: Relative percentage difference:
 
-  $$\frac{\text{Image A} - \text{Image B}}{|\text{Image B}|} \times 100$$
+$$\frac{\text{Image A} - \text{Image B}}{|\text{Image B}|} \times 100$$
 
-  *(Note: For signed axes like `a_mean` and `b_mean` that can sit close to `0`, `diff_a_minus_b` is more meaningful than `pct_diff_a_vs_b`.)*
+*(Note: For signed metrics like `a_mean` or `b_mean` that can cross zero, rely primarily on `diff_a_minus_b` rather than `pct_diff_a_vs_b`.)*
 
-## Best Practices for Accurate Results
+## Best Practices for Reliable Lens Comparisons
 
-* **Compare matched ROIs, not mismatched full frames:** If one shot includes slightly more bright background or out-of-focus area than the other, full-frame averages and sector pixel percentages will reflect framing differences as well as optical differences.
-* **Match focal planes when evaluating sharpness:** At minimum focus distance on macro lenses, small shifts in camera-to-subject distance or tilt change which parts of the coin/surface are in sharpest focus. Compare identically focused features.
-* **Keep exposure and white balance consistent:** Equalise brightness and apply consistent color/white-balance adjustments before measuring color bias, and watch out for blown highlights or specular flash reflections that can skew `L_mean`, chroma, and `laplacian_var`.
+* **Match subject framing via ROIs:** When comparing lenses at minimum focus distance, slight magnification differences or camera-to-subject shifts change how much bright background or dark shadow enters the frame. Always use matched ROI crops when testing color, shadow floor, or contrast.
+* **Compare sharpness on the in-focus plane:** Because lenses differ in field curvature (for example, unit-focusing vs. CRC floating-element designs), crop identically positioned patches where both lenses are critically focused before evaluating `sobel_mean`, `sobel_p90`, and `laplacian_var`.
+* **Keep RAW conversion identical:** Export both test frames with identical white balance, tone curve, sharpening, and noise-reduction settings before running the scripts.
