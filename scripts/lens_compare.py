@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare CIELAB, tonal contrast, deep blacks, per-color sector saturation, sharpness, and EXIF."""
+"""Compare CIELAB, tonal contrast, deep blacks, color saturation, sharpness, and EXIF."""
 
 import argparse
 import json
@@ -74,7 +74,9 @@ def load_rgb_float(path: str) -> np.ndarray:
     return np.clip(img.astype(np.float64), 0.0, 1.0)
 
 
-def sector_mask(hue_deg: np.ndarray, chroma: np.ndarray, min_chroma: float, start: float, end: float) -> np.ndarray:
+def sector_mask(
+    hue_deg: np.ndarray, chroma: np.ndarray, min_chroma: float, start: float, end: float
+) -> np.ndarray:
     active = chroma >= min_chroma
     if start <= end:
         in_hue = (hue_deg >= start) & (hue_deg < end)
@@ -134,7 +136,10 @@ def analyze_image(path: str, min_chroma: float) -> dict:
     l_std = float(np.std(L))
 
     lum = np.clip(L / 100.0, 0.0, 1.0)
-    sobel_mag = filters.sobel(lum)
+    gx = filters.sobel_h(lum)
+    gy = filters.sobel_v(lum)
+    sobel_mag = np.hypot(gx, gy)
+    tenengrad = gx**2 + gy**2
     laplacian = filters.laplace(lum)
 
     total_pixels = L.size
@@ -165,6 +170,8 @@ def analyze_image(path: str, min_chroma: float) -> dict:
             "colored_pixel_pct": float(colored_pixels / total_pixels * 100.0) if total_pixels > 0 else 0.0,
             "sobel_mean": float(np.mean(sobel_mag)),
             "sobel_p90": float(np.percentile(sobel_mag, 90)),
+            "tenengrad_mean": float(np.mean(tenengrad)),
+            "tenengrad_p90": float(np.percentile(tenengrad, 90)),
             "laplacian_var": float(np.var(laplacian)),
         },
         "by_color": by_color,
@@ -190,6 +197,7 @@ def build_summary(stats_a: dict, stats_b: dict, color_deltas: dict) -> dict:
     diff_std = ga["L_std"] - gb["L_std"]
     diff_chroma = ga["chroma_mean"] - gb["chroma_mean"]
     diff_sharp = ga["sobel_mean"] - gb["sobel_mean"]
+    diff_ten = ga["tenengrad_mean"] - gb["tenengrad_mean"]
 
     warmth_bias = classify_bias(
         diff_b, 0.25, "A warmer / more yellow than B", "A cooler / more blue than B", "Neutral warmth balance"
@@ -201,16 +209,35 @@ def build_summary(stats_a: dict, stats_b: dict, color_deltas: dict) -> dict:
         diff_L, 0.50, "A brighter/higher L* than B", "A darker/lower L* than B", "Similar overall lightness (L*)"
     )
     black_level_bias = classify_bias(
-        diff_p05, 0.50, "A lifted/lighter blacks (L_p05) than B", "A deeper blacks/shadows (L_p05) than B", "Similar shadow floor (L_p05)"
+        diff_p05,
+        0.50,
+        "A lifted/lighter blacks (L_p05) than B",
+        "A deeper blacks/shadows (L_p05) than B",
+        "Similar shadow floor (L_p05)",
     )
     tonal_contrast_bias = classify_bias(
-        diff_std, 0.40, "A higher tonal contrast (L_std) than B", "A lower tonal contrast (L_std) than B", "Similar tonal contrast (L_std)"
+        diff_std,
+        0.40,
+        "A higher tonal contrast (L_std) than B",
+        "A lower tonal contrast (L_std) than B",
+        "Similar tonal contrast (L_std)",
     )
     chroma_bias = classify_bias(
         diff_chroma, 0.35, "A higher overall chroma than B", "A lower overall chroma than B", "Similar overall chroma"
     )
     sharpness_bias = classify_bias(
-        diff_sharp, 0.0015, "A higher edge gradient/micro-contrast than B", "A lower edge gradient/micro-contrast than B", "Similar edge gradient"
+        diff_sharp,
+        0.0015,
+        "A higher edge gradient/micro-contrast than B",
+        "A lower edge gradient/micro-contrast than B",
+        "Similar edge gradient",
+    )
+    tenengrad_bias = classify_bias(
+        diff_ten,
+        0.0002,
+        "A higher Tenengrad energy than B",
+        "A lower Tenengrad energy than B",
+        "Similar Tenengrad energy",
     )
 
     best_sector = None
@@ -236,9 +263,9 @@ def build_summary(stats_a: dict, stats_b: dict, color_deltas: dict) -> dict:
         favors.append("deeper blacks/shadows")
     elif diff_p05 > 0.50:
         favors.append("lifted/lighter blacks")
-    if diff_std > 0.40 or diff_sharp > 0.0015:
+    if diff_std > 0.40 or diff_sharp > 0.0015 or diff_ten > 0.0002:
         favors.append("stronger contrast/micro-contrast")
-    elif diff_std < -0.40 or diff_sharp < -0.0015:
+    elif diff_std < -0.40 or diff_sharp < -0.0015 or diff_ten < -0.0002:
         favors.append("gentler contrast/micro-contrast")
 
     summary_text = (
@@ -257,6 +284,7 @@ def build_summary(stats_a: dict, stats_b: dict, color_deltas: dict) -> dict:
         "tonal_contrast_bias": tonal_contrast_bias,
         "chroma_bias": chroma_bias,
         "sharpness_bias": sharpness_bias,
+        "tenengrad_bias": tenengrad_bias,
         "largest_chroma_shift": {
             "sector": best_sector,
             "diff_a_minus_b": (
@@ -424,14 +452,15 @@ def main() -> int:
         print(f"{sector:<20} {ca['pixel_pct']:>7.1f}% {cb['pixel_pct']:>7.1f}% {c_a_str} {c_b_str} {dc_str}")
 
     print("\n=== Summary & Bias ===")
-    print(f"Narrative    : {summary['narrative']}")
-    print(f"Warmth       : {summary['warmth_bias']}")
-    print(f"Red-Green    : {summary['red_green_bias']}")
-    print(f"Lightness    : {summary['lightness_bias']}")
-    print(f"Black Level  : {summary['black_level_bias']}")
+    print(f"Narrative     : {summary['narrative']}")
+    print(f"Warmth        : {summary['warmth_bias']}")
+    print(f"Red-Green     : {summary['red_green_bias']}")
+    print(f"Lightness     : {summary['lightness_bias']}")
+    print(f"Black Level   : {summary['black_level_bias']}")
     print(f"Tonal Contrast: {summary['tonal_contrast_bias']}")
-    print(f"Chroma       : {summary['chroma_bias']}")
-    print(f"Sharpness    : {summary['sharpness_bias']}")
+    print(f"Chroma        : {summary['chroma_bias']}")
+    print(f"Sharpness     : {summary['sharpness_bias']}")
+    print(f"Tenengrad     : {summary['tenengrad_bias']}")
 
     return 0
 
